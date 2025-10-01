@@ -1,6 +1,6 @@
 #include <cstddef>
 #include <type_traits>
-#include <new>
+#include <new> // std::align_val_t, aligned operator new/delete
 #include <memory>
 #include <utility>
 #include <map>
@@ -16,17 +16,15 @@ struct FixedAlloc
         using other = FixedAlloc<U, N>;
     };
 
-    FixedAlloc() noexcept : pool_(std::make_shared<Pool>()) {}
-
+    FixedAlloc() noexcept = default;
     template <class U>
-    FixedAlloc(const FixedAlloc<U, N> &) noexcept
-        : pool_(std::make_shared<Pool>()) {}
+    FixedAlloc(const FixedAlloc<U, N> &) noexcept {}
 
     [[nodiscard]] T *allocate(std::size_t n)
     {
         if (n == 0)
             return nullptr;
-        auto &P = *pool_;
+        Pool &P = pool();
         if (!P.mem)
         {
             P.mem = ::operator new(N * sizeof(T), std::align_val_t(alignof(T)));
@@ -43,8 +41,10 @@ struct FixedAlloc
     {
     }
 
-    bool operator==(const FixedAlloc &rhs) const noexcept { return pool_.get() == rhs.pool_.get(); }
-    bool operator!=(const FixedAlloc &rhs) const noexcept { return !(*this == rhs); }
+    template <class U>
+    bool operator==(const FixedAlloc<U, N> &) const noexcept { return true; }
+    template <class U>
+    bool operator!=(const FixedAlloc<U, N> &) const noexcept { return false; }
 
 private:
     struct Pool
@@ -62,7 +62,11 @@ private:
         }
     };
 
-    std::shared_ptr<Pool> pool_;
+    static Pool &pool()
+    {
+        static Pool P;
+        return P;
+    }
 };
 
 template <class T, class Alloc = std::allocator<T>>
@@ -81,7 +85,9 @@ class SimpleList
 
 public:
     SimpleList() = default;
-    explicit SimpleList(const Alloc &a) : alloc_(a) {}
+
+    explicit SimpleList(const Alloc &a) : node_alloc_(NodeAlloc(a)) {}
+
     ~SimpleList() { clear(); }
 
     void push_back(const T &x) { emplace_back(x); }
@@ -90,22 +96,22 @@ public:
     template <class... Args>
     void emplace_back(Args &&...args)
     {
-        NodeAlloc a(alloc_);
+        Node *nodep = AT::allocate(node_alloc_, 1);
         try
         {
-            AT::construct(a, n, T(std::forward<Args>(args)...));
+            AT::construct(node_alloc_, nodep, T(std::forward<Args>(args)...));
         }
         catch (...)
         {
-            AT::deallocate(a, n, 1);
+            AT::deallocate(node_alloc_, nodep, 1);
             throw;
         }
         if (!head_)
-            head_ = tail_ = n;
+            head_ = tail_ = nodep;
         else
         {
-            tail_->next = n;
-            tail_ = n;
+            tail_->next = nodep;
+            tail_ = nodep;
         }
     }
 
@@ -118,13 +124,12 @@ public:
 
     void clear()
     {
-        NodeAlloc a(alloc_);
         Node *p = head_;
         while (p)
         {
             Node *q = p->next;
-            AT::destroy(a, p);
-            AT::deallocate(a, p, 1);
+            AT::destroy(node_alloc_, p);
+            AT::deallocate(node_alloc_, p, 1);
             p = q;
         }
         head_ = tail_ = nullptr;
@@ -133,7 +138,7 @@ public:
 private:
     Node *head_ = nullptr;
     Node *tail_ = nullptr;
-    Alloc alloc_{};
+    NodeAlloc node_alloc_{};
 };
 
 static int fact(int n)
