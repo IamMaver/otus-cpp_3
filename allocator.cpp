@@ -16,34 +16,54 @@ struct FixedAlloc
         using other = FixedAlloc<U, N>;
     };
 
-    FixedAlloc() noexcept {}
-    template <class U>
-    FixedAlloc(const FixedAlloc<U, N> &) noexcept {}
+    FixedAlloc() noexcept : pool_(std::make_shared<Pool>()) {}
 
-    T *allocate(std::size_t n)
+    template <class U>
+    FixedAlloc(const FixedAlloc<U, N> &) noexcept
+        : pool_(std::make_shared<Pool>()) {}
+
+    [[nodiscard]] T *allocate(std::size_t n)
     {
-        if (_used + n > N)
+        if (n == 0)
+            return nullptr;
+        auto &P = *pool_;
+        if (!P.mem)
+        {
+            P.mem = ::operator new(N * sizeof(T), std::align_val_t(alignof(T)));
+            P.used = 0;
+        }
+        if (P.used + n > N)
             throw std::bad_alloc();
-        auto p = reinterpret_cast<T *>(&_buf[_used]);
-        _used += n;
+        T *p = static_cast<T *>(P.mem) + P.used;
+        P.used += n;
         return p;
     }
-    void deallocate(T *, std::size_t) noexcept {}
 
-    template <class U>
-    bool operator==(const FixedAlloc<U, N> &) const noexcept { return true; }
-    template <class U>
-    bool operator!=(const FixedAlloc<U, N> &) const noexcept { return false; }
+    void deallocate(T *, std::size_t) noexcept
+    {
+    }
+
+    bool operator==(const FixedAlloc &rhs) const noexcept { return pool_.get() == rhs.pool_.get(); }
+    bool operator!=(const FixedAlloc &rhs) const noexcept { return !(*this == rhs); }
 
 private:
-    using slot = typename std::aligned_storage<sizeof(T), alignof(T)>::type;
-    static slot _buf[N];
-    static std::size_t _used;
+    struct Pool
+    {
+        void *mem = nullptr;
+        std::size_t used = 0;
+
+        ~Pool()
+        {
+            if (mem)
+            {
+                ::operator delete(mem, std::align_val_t(alignof(T)));
+                mem = nullptr;
+            }
+        }
+    };
+
+    std::shared_ptr<Pool> pool_;
 };
-template <class T, std::size_t N>
-typename FixedAlloc<T, N>::slot FixedAlloc<T, N>::_buf[N];
-template <class T, std::size_t N>
-std::size_t FixedAlloc<T, N>::_used = 0;
 
 template <class T, class Alloc = std::allocator<T>>
 class SimpleList
@@ -52,9 +72,10 @@ class SimpleList
     {
         T v;
         Node *next;
-        Node(const T &x) : v(x), next(0) {}
-        Node(T &&x) : v(std::move(x)), next(0) {}
+        Node(const T &x) : v(x), next(nullptr) {}
+        Node(T &&x) : v(std::move(x)), next(nullptr) {}
     };
+
     using NodeAlloc = typename std::allocator_traits<Alloc>::template rebind_alloc<Node>;
     using AT = std::allocator_traits<NodeAlloc>;
 
@@ -70,12 +91,17 @@ public:
     void emplace_back(Args &&...args)
     {
         NodeAlloc a(alloc_);
-        Node *n = AT::allocate(a, 1);
-        AT::construct(a, n, T(std::forward<Args>(args)...));
-        if (!head_)
+        try
         {
-            head_ = tail_ = n;
+            AT::construct(a, n, T(std::forward<Args>(args)...));
         }
+        catch (...)
+        {
+            AT::deallocate(a, n, 1);
+            throw;
+        }
+        if (!head_)
+            head_ = tail_ = n;
         else
         {
             tail_->next = n;
@@ -101,12 +127,12 @@ public:
             AT::deallocate(a, p, 1);
             p = q;
         }
-        head_ = tail_ = 0;
+        head_ = tail_ = nullptr;
     }
 
 private:
-    Node *head_ = 0;
-    Node *tail_ = 0;
+    Node *head_ = nullptr;
+    Node *tail_ = nullptr;
     Alloc alloc_{};
 };
 
@@ -132,7 +158,7 @@ int main()
     {
         using Pair = std::pair<const int, int>;
         using AMap = FixedAlloc<Pair, 11>;
-        std::map<int, int, std::less<int>, AMap> m;
+        std::map<int, int, std::less<int>, AMap> m((std::less<int>{}), AMap{});
         for (int i = 0; i < 10; ++i)
             m.emplace(i, fact(i));
         for (const auto &kv : m)
